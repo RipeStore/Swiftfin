@@ -2,7 +2,7 @@ name: Build & Release Swiftfin IPAs
 
 on:
   schedule:
-    # Automatically check upstream every 12 hours
+    # Automatically check upstream every 6 hours
     - cron: '0 */12 * * *'
 
   workflow_dispatch:
@@ -135,6 +135,9 @@ jobs:
     needs: check-upstream
     if: needs.check-upstream.outputs.should_build == 'true'
     runs-on: macos-15
+    env:
+      NSUnbufferedIO: "YES"
+      GIT_TERMINAL_PROMPT: "0"
     strategy:
       fail-fast: false
       matrix:
@@ -148,14 +151,9 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Setup Ruby
-        uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.3'
-          bundler-cache: true
-
-      - name: Configure Xcode & CI Defaults
+      - name: Select Xcode & Configure Environment
         run: |
+          # Pick the latest Xcode 16.x available on the runner
           XCODE_APP=$(find /Applications -maxdepth 1 -name "Xcode_16*.app" | sort -V | tail -n 1)
           if [ -z "$XCODE_APP" ]; then
             XCODE_APP=$(find /Applications -maxdepth 1 -name "Xcode*.app" | sort -V | tail -n 1)
@@ -163,28 +161,54 @@ jobs:
           echo "Selected Xcode: $XCODE_APP"
           sudo xcode-select -s "$XCODE_APP/Contents/Developer"
           echo "DEVELOPER_DIR=$XCODE_APP/Contents/Developer" >> "$GITHUB_ENV"
+          xcodebuild -version
 
-          # Clean Git defaults
-          git config --global advice.detachedHead false
-          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          # Wake CoreSimulator daemon to prevent xcodebuild hangs in headless CI
+          xcrun simctl list > /dev/null 2>&1 || true
 
-          # Skip Macro & Plugin validation prompts in CI
+          # Force Xcode to use system git (prevents libgit2 SPM freeze)
+          defaults write com.apple.dt.Xcode IDEPackageSupportUseBuiltinSCM YES
+
+          # Skip interactive macro/plugin trust prompts in CI
           defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES
-          defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidation -bool YES
+          defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES
 
       - name: Install Homebrew dependencies
-        run: brew bundle --file Brewfile || brew install carthage swiftgen swiftlint xcbeautify
+        run: |
+          brew bundle --file Brewfile || brew install carthage swiftgen swiftlint xcbeautify
 
       - name: Cache Carthage
         uses: actions/cache@v4
-        id: carthage-cache
         with:
-          path: Carthage
-          key: ${{ runner.os }}-carthage-${{ hashFiles('**/Cartfile.resolved') }}
+          path: |
+            Carthage
+            ~/Library/Caches/org.carthage.CarthageKit
+          key: ${{ runner.os }}-carthage-${{ hashFiles('**/Cartfile.resolved', '**/Cartfile') }}
           restore-keys: ${{ runner.os }}-carthage-
 
-      - name: Update Carthage
-        run: carthage update --use-xcframeworks --cache-builds
+      - name: Bootstrap Carthage Frameworks
+        run: |
+          carthage update --use-xcframeworks --cache-builds
+
+      - name: Cache Swift Package Dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+          key: ${{ runner.os }}-${{ matrix.platform }}-spm-${{ hashFiles('**/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.platform }}-spm-
+
+      - name: Resolve Swift Packages
+        run: |
+          set -euo pipefail
+          echo "📦 Resolving Swift Package dependencies..."
+          xcodebuild -resolvePackageDependencies \
+            -project Swiftfin.xcodeproj \
+            -scheme "${{ matrix.scheme }}" \
+            -skipMacroValidation \
+            -skipPackagePluginValidation 2>&1 | tee /dev/stderr | tail -1
+          echo "✅ Package resolution complete."
 
       - name: Build Unsigned Archive & Package IPA
         env:
@@ -194,6 +218,7 @@ jobs:
           TAG: ${{ needs.check-upstream.outputs.tag }}
         run: |
           set -euo pipefail
+          set -o pipefail
 
           ARCHIVE_PATH="build/${SCHEME}.xcarchive"
           IPA_NAME="Swiftfin-${PLATFORM}-${TAG}-unsigned.ipa"
@@ -201,32 +226,60 @@ jobs:
 
           mkdir -p build
 
-          echo "⚙️ Archiving ${SCHEME} using standard DerivedData SPM resolution..."
+          # ──────────────────────────────────────────────────────────────
+          # KEY: Use ad-hoc signing (CODE_SIGN_IDENTITY="-") instead of
+          # CODE_SIGNING_ALLOWED=NO. This is critical because:
+          #
+          # 1. The project uses StatefulMacro (a Swift Macro package).
+          #    Swift macros compile into macOS executables that run during
+          #    the build to expand macro invocations.
+          #
+          # 2. On Apple Silicon (which GitHub Actions macos-15 runners use),
+          #    macOS requires ALL executables to be at least ad-hoc signed.
+          #
+          # 3. CODE_SIGNING_ALLOWED=NO prevents signing of ALL targets,
+          #    including macro plugin executables. When swift-frontend tries
+          #    to launch the unsigned macro binary, macOS SIGKILL's it.
+          #    swift-frontend then deadlocks waiting for IPC from the dead
+          #    process — no error, no output, infinite hang.
+          #
+          # 4. CODE_SIGN_IDENTITY="-" ad-hoc signs everything. Macro plugins
+          #    can execute, and the resulting .app is trivially re-signable
+          #    by any sideloading tool (TrollStore, AltStore, Sideloadly, etc).
+          # ──────────────────────────────────────────────────────────────
+
+          echo "⚙️ Archiving ${SCHEME} with ad-hoc signing..."
           xcodebuild archive \
             -project Swiftfin.xcodeproj \
             -scheme "${SCHEME}" \
             -configuration Release \
             -destination "${DESTINATION}" \
             -archivePath "${ARCHIVE_PATH}" \
-            -derivedDataPath "build/DerivedData" \
-            -skipMacroValidation \
-            -skipPackagePluginValidation \
-            COMPILER_INDEX_STORE_ENABLE=NO \
-            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="-" \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGN_ENTITLEMENTS="" \
-            AD_HOC_CODE_SIGNING_ALLOWED=YES | xcbeautify
+            CODE_SIGNING_ALLOWED=YES \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            -skipMacroValidation \
+            -skipPackagePluginValidation 2>&1 | (which xcbeautify >/dev/null 2>&1 && xcbeautify --quiet || cat)
 
           echo "📦 Locating .app bundle..."
           APP_PATH=$(find "${ARCHIVE_PATH}/Products/Applications" -maxdepth 1 -name "*.app" | head -n 1)
-
+          
           if [ -z "$APP_PATH" ] || [ ! -d "$APP_PATH" ]; then
             echo "❌ Failed to find compiled .app bundle in ${ARCHIVE_PATH}/Products/Applications"
             exit 1
           fi
 
-          echo "Packaging into unsigned IPA: ${IPA_NAME}..."
+          # Strip ad-hoc signature so sideloading tools get a clean unsigned binary
+          echo "🔓 Stripping ad-hoc signature..."
+          codesign --remove-signature "${APP_PATH}" 2>/dev/null || true
+          find "${APP_PATH}" -name "*.dylib" -o -name "*.framework" | while read -r f; do
+            codesign --remove-signature "$f" 2>/dev/null || true
+          done
+
+          echo "📦 Packaging into unsigned IPA: ${IPA_NAME}..."
           mkdir -p "${PAYLOAD_DIR}"
           cp -R "${APP_PATH}" "${PAYLOAD_DIR}/"
 
@@ -282,10 +335,10 @@ jobs:
           fi
 
           echo "🚀 Publishing 1:1 Release '$TAG' with title '$RELEASE_TITLE'..."
-
+          
           gh release delete "$TAG" --yes 2>/dev/null || true
           git tag -d "$TAG" 2>/dev/null || true
-
+          
           EXTRA_FLAGS=()
           if [ "$IS_PRERELEASE" = "true" ]; then
             EXTRA_FLAGS+=("--prerelease")
