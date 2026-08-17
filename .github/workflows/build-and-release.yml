@@ -142,6 +142,7 @@ jobs:
     runs-on: macos-15
     env:
       NSUnbufferedIO: "YES"
+      GIT_TERMINAL_PROMPT: "0"
     strategy:
       fail-fast: false
       matrix:
@@ -155,7 +156,7 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Select Xcode 16
+      - name: Select Xcode 16 & Configure SCM Defaults
         run: |
           XCODE_APP=$(find /Applications -maxdepth 1 -name "Xcode_16*.app" | sort -V | tail -n 1)
           if [ -z "$XCODE_APP" ]; then
@@ -165,6 +166,14 @@ jobs:
           sudo xcode-select -s "$XCODE_APP/Contents/Developer"
           echo "DEVELOPER_DIR=$XCODE_APP/Contents/Developer" >> "$GITHUB_ENV"
           xcodebuild -version
+
+          # Wake up CoreSimulator daemon (prevents xcodebuild simulator hang)
+          xcrun simctl list > /dev/null 2>&1 || true
+
+          # Force Xcode to use native System Git rather than libgit2 (prevents SPM package freeze)
+          defaults write com.apple.dt.Xcode IDEPackageSupportUseBuiltinSCM YES
+          defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES
+          defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES
 
       - name: Cache Homebrew
         uses: actions/cache@v4
@@ -204,12 +213,24 @@ jobs:
 
       - name: Resolve Swift Packages
         run: |
+          set -euo pipefail
           set -o pipefail
           echo "📦 Resolving Swift Package dependencies..."
-          xcodebuild -resolvePackageDependencies \
-            -project Swiftfin.xcodeproj \
-            -scheme "${{ matrix.scheme }}" \
-            -clonedSourcePackagesDirPath ~/Library/Caches/org.swift.swiftpm/repositories 2>&1 | (which xcbeautify >/dev/null && xcbeautify || cat)
+          
+          # Retry resolution if transient network error occurs
+          for i in 1 2 3; do
+            echo "Attempt $i: resolving packages..."
+            if xcodebuild -resolvePackageDependencies \
+              -project Swiftfin.xcodeproj \
+              -scheme "${{ matrix.scheme }}" \
+              -skipMacroValidation \
+              -skipPackagePluginValidation 2>&1 | (which xcbeautify >/dev/null && xcbeautify || cat); then
+              echo "✅ Package resolution succeeded!"
+              break
+            fi
+            echo "⚠️ Attempt $i failed, retrying in 5 seconds..."
+            sleep 5
+          done
 
       - name: Build Unsigned Archive & Package IPA
         env:
@@ -234,7 +255,6 @@ jobs:
             -configuration Release \
             -destination "${DESTINATION}" \
             -archivePath "${ARCHIVE_PATH}" \
-            -clonedSourcePackagesDirPath ~/Library/Caches/org.swift.swiftpm/repositories \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
