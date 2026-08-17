@@ -70,20 +70,17 @@ jobs:
             TARGET_REF="$INPUT_TARGET"
             echo "Manual target requested: $TARGET_REF"
 
-            # Check if TARGET_REF matches an upstream tag
             if gh api "repos/$UPSTREAM_REPO/releases/tags/$TARGET_REF" >/dev/null 2>&1; then
               TAG_NAME="$TARGET_REF"
             elif gh api "repos/$UPSTREAM_REPO/git/ref/tags/$TARGET_REF" >/dev/null 2>&1; then
               TAG_NAME="$TARGET_REF"
             else
-              # It could be a branch (like 'main') or commit SHA
               SHORT_DATE=$(date +'%Y%m%d')
               TAG_NAME="nightly-${TARGET_REF}-${SHORT_DATE}"
               PRERELEASE="true"
               echo "Target is a branch/commit. Using release tag: $TAG_NAME"
             fi
           else
-            # Automated mode: Query latest release or tag from upstream
             LATEST_TAG=$(gh api "repos/$UPSTREAM_REPO/releases/latest" --jq .tag_name 2>/dev/null || true)
             if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
               LATEST_TAG=$(gh api "repos/$UPSTREAM_REPO/tags" --jq '.[0].name')
@@ -98,7 +95,6 @@ jobs:
             exit 1
           fi
 
-          # Check if this release already exists in current repo
           EXISTS_IN_REPO="false"
           if gh release view "$TAG_NAME" --repo "$CURRENT_REPO" >/dev/null 2>&1; then
             EXISTS_IN_REPO="true"
@@ -112,7 +108,6 @@ jobs:
 
           echo "🚀 Target confirmed: Building $TARGET_REF as release $TAG_NAME"
 
-          # Resolve build matrix
           case "$INPUT_PLATFORM" in
             ios)
               MATRIX='[{"platform":"ios","scheme":"Swiftfin","destination":"generic/platform=iOS"}]'
@@ -167,12 +162,13 @@ jobs:
           echo "DEVELOPER_DIR=$XCODE_APP/Contents/Developer" >> "$GITHUB_ENV"
           xcodebuild -version
 
-          # Wake up CoreSimulator daemon (prevents xcodebuild simulator hang)
+          # Wake up CoreSimulator daemon
           xcrun simctl list > /dev/null 2>&1 || true
 
-          # Force Xcode to use native System Git rather than libgit2 (prevents SPM package freeze)
-          defaults write com.apple.dt.Xcode IDEPackageSupportUseBuiltinSCM NO
+          # Enable Builtin SCM to prevent external git subprocess deadlocks
+          defaults write com.apple.dt.Xcode IDEPackageSupportUseBuiltinSCM YES
           defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES
+          defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidation -bool YES
           defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES
 
       - name: Cache Homebrew
@@ -204,34 +200,10 @@ jobs:
       - name: Cache Swift Package Dependencies
         uses: actions/cache@v4
         with:
-          path: |
-            ~/Library/Caches/org.swift.swiftpm
-            ~/Library/Developer/Xcode/DerivedData
-          key: ${{ runner.os }}-${{ matrix.platform }}-spm-${{ hashFiles('**/Package.resolved') }}
+          path: ~/Library/Caches/org.swift.swiftpm
+          key: ${{ runner.os }}-spm-cache-${{ hashFiles('**/Package.resolved', '**/Swiftfin.xcodeproj/**') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.platform }}-spm-
-
-      - name: Resolve Swift Packages
-        run: |
-          set -euo pipefail
-          set -o pipefail
-          echo "📦 Resolving Swift Package dependencies..."
-          
-          # Retry resolution if transient network error occurs
-          for i in 1 2 3; do
-            echo "Attempt $i: resolving packages..."
-            if xcodebuild -resolvePackageDependencies \
-              -project Swiftfin.xcodeproj \
-              -scheme "${{ matrix.scheme }}" \
-              -skipMacroValidation \
-              -skipPackagePluginValidation \
-              -disablePackageRepositoryCache 2>&1 | (which xcbeautify >/dev/null && xcbeautify || cat); then
-              echo "✅ Package resolution succeeded!"
-              break
-            fi
-            echo "⚠️ Attempt $i failed, retrying in 5 seconds..."
-            sleep 5
-          done
+            ${{ runner.os }}-spm-cache-
 
       - name: Build Unsigned Archive & Package IPA
         env:
@@ -249,20 +221,21 @@ jobs:
 
           mkdir -p build
 
-          echo "⚙️ Archiving ${SCHEME} without code signing..."
+          echo "⚙️ Archiving ${SCHEME} without code signing (SPM resolution handled automatically)..."
           xcodebuild archive \
             -project Swiftfin.xcodeproj \
             -scheme "${SCHEME}" \
             -configuration Release \
             -destination "${DESTINATION}" \
             -archivePath "${ARCHIVE_PATH}" \
+            -clonedSourcePackagesDirPath ".build/SourcePackages" \
+            -skipMacroValidation \
+            -skipPackagePluginValidation \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGN_ENTITLEMENTS="" \
-            AD_HOC_CODE_SIGNING_ALLOWED=YES \
-            -skipMacroValidation \
-            -skipPackagePluginValidation 2>&1 | (which xcbeautify >/dev/null && xcbeautify || cat)
+            AD_HOC_CODE_SIGNING_ALLOWED=YES | xcbeautify || true
 
           echo "📦 Locating .app bundle..."
           APP_PATH=$(find "${ARCHIVE_PATH}/Products/Applications" -maxdepth 1 -name "*.app" | head -n 1)
@@ -329,7 +302,6 @@ jobs:
 
           echo "🚀 Publishing 1:1 Release '$TAG' with title '$RELEASE_TITLE'..."
           
-          # Delete existing release if force rebuild was requested
           gh release delete "$TAG" --yes 2>/dev/null || true
           git tag -d "$TAG" 2>/dev/null || true
           
