@@ -2,7 +2,7 @@ name: Build & Release Swiftfin IPAs
 
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 */12 * * *'
 
   workflow_dispatch:
     inputs:
@@ -134,7 +134,7 @@ jobs:
     needs: check-upstream
     if: needs.check-upstream.outputs.should_build == 'true'
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       NSUnbufferedIO: "YES"
       GIT_TERMINAL_PROMPT: "0"
@@ -149,11 +149,16 @@ jobs:
           repository: jellyfin/Swiftfin
           ref: ${{ needs.check-upstream.outputs.git_ref }}
           submodules: recursive
-          fetch-depth: 1
+
+      # ─── Ruby + Fastlane (mirrors official Swiftfin CI) ───
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
 
       - name: Select Xcode & Accept License
         run: |
-          # Pick the latest Xcode 16.x available on the runner
           XCODE_APP=$(find /Applications -maxdepth 1 -name "Xcode_16*.app" | sort -V | tail -n 1)
           if [ -z "$XCODE_APP" ]; then
             XCODE_APP=$(find /Applications -maxdepth 1 -name "Xcode*.app" | sort -V | tail -n 1)
@@ -161,115 +166,86 @@ jobs:
           echo "Selected Xcode: $XCODE_APP"
           sudo xcode-select -s "$XCODE_APP/Contents/Developer"
           echo "DEVELOPER_DIR=$XCODE_APP/Contents/Developer" >> "$GITHUB_ENV"
-
-          # ─── CRITICAL: Accept Xcode license non-interactively ───
-          # Without this, xcodebuild can hang silently waiting for
-          # license acceptance in a non-interactive CI shell.
           sudo xcodebuild -license accept
-
           xcodebuild -version
 
-          # Skip interactive macro/plugin trust prompts in CI
+          # Skip macro/plugin trust prompts
           defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES
           defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES
 
       - name: Install Homebrew Dependencies
-        run: |
-          brew install xcbeautify 2>/dev/null || true
-          brew bundle --file Brewfile || brew install carthage swiftgen swiftlint
+        run: brew bundle --file Brewfile
 
       - name: Cache Carthage
         uses: actions/cache@v4
         with:
-          path: |
-            Carthage
-            ~/Library/Caches/org.carthage.CarthageKit
-          key: ${{ runner.os }}-carthage-${{ hashFiles('**/Cartfile.resolved', '**/Cartfile') }}
+          path: Carthage
+          key: ${{ runner.os }}-carthage-${{ hashFiles('**/Cartfile.resolved') }}
           restore-keys: ${{ runner.os }}-carthage-
 
-      - name: Bootstrap Carthage (VLCKit)
-        run: |
-          carthage update --use-xcframeworks --cache-builds
+      - name: Update Carthage (VLCKit)
+        run: carthage update --use-xcframeworks --cache-builds
 
-      - name: Build & Package Unsigned IPA
+      # ─── Build via Fastlane (exact same command as official CI) ───
+      - name: Build via Fastlane
+        uses: nick-fields/retry@v2
+        with:
+          max_attempts: 3
+          retry_on: error
+          timeout_minutes: 60
+          command: bundle exec fastlane buildLane scheme:"\"${{ matrix.scheme }}\""
+
+      # ─── Package .app from DerivedData into unsigned IPA ───
+      - name: Package Unsigned IPA
         env:
           SCHEME: ${{ matrix.scheme }}
-          DESTINATION: ${{ matrix.destination }}
           PLATFORM: ${{ matrix.platform }}
           TAG: ${{ needs.check-upstream.outputs.tag }}
         run: |
           set -euo pipefail
 
           IPA_NAME="Swiftfin-${PLATFORM}-${TAG}-unsigned.ipa"
-          DERIVED_DATA="build/DerivedData"
 
-          mkdir -p build
-
-          # ──────────────────────────────────────────────────────────────
-          # Mirror exactly what Fastlane's buildLane does:
-          #
-          #   buildApp(
-          #     scheme: scheme,
-          #     exportMethod: "development",
-          #     skipArchive: true,         → xcodebuild BUILD, not archive
-          #     skipCodesigning: true,     → CODE_SIGNING_ALLOWED=NO
-          #     xcargs: "-skipMacroValidation",
-          #     skipProfileDetection: true
-          #   )
-          #
-          # Fastlane does NOT run a separate -resolvePackageDependencies
-          # step. SPM resolves inline during the build. The standalone
-          # resolve command is known to deadlock in Xcode 16 CI.
-          # ──────────────────────────────────────────────────────────────
-
-          echo "⚙️ Building ${SCHEME} (mirroring Fastlane buildLane)..."
-          xcodebuild build \
-            -project Swiftfin.xcodeproj \
-            -scheme "${SCHEME}" \
-            -configuration Release \
-            -destination "${DESTINATION}" \
-            -derivedDataPath "${DERIVED_DATA}" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            AD_HOC_CODE_SIGNING_ALLOWED=YES \
-            -skipMacroValidation \
-            -skipPackagePluginValidation 2>&1 | xcbeautify --quiet || true
-
-          echo "✅ Build complete."
-
-          # Find .app in DerivedData
           echo "📦 Locating .app bundle..."
-          APP_PATH=$(find "${DERIVED_DATA}" -path "*/Build/Products/Release-*/*.app" -not -path "*/PlugIns/*" -maxdepth 6 | head -n 1)
+
+          # Fastlane buildLane uses xcodebuild build (skipArchive: true)
+          # .app lands in DerivedData/Build/Products/Release-iphoneos/ or Release-appletvos/
+          APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData \
+            -path "*/Build/Products/Release-*/*.app" \
+            -not -path "*/PlugIns/*" \
+            -maxdepth 7 2>/dev/null | head -n 1)
 
           if [ -z "$APP_PATH" ] || [ ! -d "$APP_PATH" ]; then
-            echo "⚠️ Primary search failed, trying broader search..."
-            APP_PATH=$(find "${DERIVED_DATA}" -name "*.app" -type d -not -path "*/PlugIns/*" -not -path "*Intermediates*" | head -n 1)
+            echo "⚠️ Trying broader DerivedData search..."
+            APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData \
+              -name "Swiftfin*.app" -type d \
+              -not -path "*/PlugIns/*" \
+              -not -path "*Intermediates*" 2>/dev/null | head -n 1)
           fi
 
           if [ -z "$APP_PATH" ] || [ ! -d "$APP_PATH" ]; then
-            echo "❌ Failed to find .app bundle. DerivedData contents:"
-            find "${DERIVED_DATA}" -name "*.app" -type d 2>/dev/null || true
+            echo "❌ Failed to find .app. DerivedData contents:"
+            find ~/Library/Developer/Xcode/DerivedData -name "*.app" -type d 2>/dev/null || true
             exit 1
           fi
 
           echo "Found: $APP_PATH"
 
-          # Strip any residual signatures for clean unsigned IPA
+          # Strip code signatures for clean unsigned IPA
           codesign --remove-signature "${APP_PATH}" 2>/dev/null || true
-          find "${APP_PATH}" \( -name "*.dylib" -o -name "*.framework" \) -print0 | while IFS= read -r -d '' f; do
-            codesign --remove-signature "$f" 2>/dev/null || true
-          done
+          find "${APP_PATH}" \( -name "*.dylib" -o -name "*.framework" \) -print0 | \
+            while IFS= read -r -d '' f; do
+              codesign --remove-signature "$f" 2>/dev/null || true
+            done
 
           # Package into IPA
-          echo "📦 Packaging ${IPA_NAME}..."
-          PAYLOAD_DIR="build/payload_${PLATFORM}/Payload"
+          PAYLOAD_DIR="build/Payload"
           mkdir -p "${PAYLOAD_DIR}"
           cp -R "${APP_PATH}" "${PAYLOAD_DIR}/"
 
-          cd "build/payload_${PLATFORM}"
-          zip -q -r -y "../../${IPA_NAME}" Payload
-          cd ../..
+          cd build
+          zip -q -r -y "../${IPA_NAME}" Payload
+          cd ..
 
           ls -lh "${IPA_NAME}"
           echo "🎉 Done: ${IPA_NAME}"
