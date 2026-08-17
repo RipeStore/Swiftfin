@@ -190,24 +190,32 @@ jobs:
         run: |
           carthage update --use-xcframeworks --cache-builds
 
-      - name: Cache Swift Package Dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/Library/Caches/org.swift.swiftpm
-          key: ${{ runner.os }}-${{ matrix.platform }}-spm-${{ hashFiles('**/Package.resolved') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.platform }}-spm-
+
+
 
       - name: Resolve Swift Packages
+        timeout-minutes: 15
         run: |
           set -euo pipefail
+
+          # Clean any stale SPM state that could cause lock contention
+          rm -rf ~/Library/Caches/org.swift.swiftpm
+          rm -rf ~/Library/Developer/Xcode/DerivedData
+
           echo "📦 Resolving Swift Package dependencies..."
+          # -scmProvider system: Forces xcodebuild CLI to use system git
+          #   instead of its bundled libgit2 which deadlocks on large
+          #   dependency graphs in headless CI. The `defaults write
+          #   IDEPackageSupportUseBuiltinSCM` only works for the Xcode GUI.
+          # -disablePackageRepositoryCache: Prevents SPM cache corruption
+          #   causing lock contention on CI runners.
           xcodebuild -resolvePackageDependencies \
             -project Swiftfin.xcodeproj \
             -scheme "${{ matrix.scheme }}" \
+            -scmProvider system \
+            -disablePackageRepositoryCache \
             -skipMacroValidation \
-            -skipPackagePluginValidation 2>&1 | tee /dev/stderr | tail -1
+            -skipPackagePluginValidation
           echo "✅ Package resolution complete."
 
       - name: Build Unsigned Archive & Package IPA
@@ -255,6 +263,8 @@ jobs:
             -configuration Release \
             -destination "${DESTINATION}" \
             -archivePath "${ARCHIVE_PATH}" \
+            -scmProvider system \
+            -disablePackageRepositoryCache \
             CODE_SIGN_IDENTITY="-" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=YES \
