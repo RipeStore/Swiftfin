@@ -2,7 +2,7 @@ name: Build & Release Swiftfin IPAs
 
 on:
   schedule:
-    # Automatically check upstream every 6 hours
+    # Automatically check upstream every 12 hours
     - cron: '0 */12 * * *'
 
   workflow_dispatch:
@@ -138,6 +138,7 @@ jobs:
     env:
       NSUnbufferedIO: "YES"
       GIT_TERMINAL_PROMPT: "0"
+      CI: "true"
     strategy:
       fail-fast: false
       matrix:
@@ -151,7 +152,9 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Select Xcode 16 & Configure SCM Defaults
+      - name: Select Xcode 16 & Configure Defaults
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           XCODE_APP=$(find /Applications -maxdepth 1 -name "Xcode_16*.app" | sort -V | tail -n 1)
           if [ -z "$XCODE_APP" ]; then
@@ -162,11 +165,17 @@ jobs:
           echo "DEVELOPER_DIR=$XCODE_APP/Contents/Developer" >> "$GITHUB_ENV"
           xcodebuild -version
 
-          # Wake up CoreSimulator daemon
-          xcrun simctl list > /dev/null 2>&1 || true
+          # Configure Git to avoid SSH prompts and network compression bottlenecks
+          git config --global advice.detachedHead false
+          git config --global core.compression 0
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
 
-          # Enable Builtin SCM to prevent external git subprocess deadlocks
-          defaults write com.apple.dt.Xcode IDEPackageSupportUseBuiltinSCM YES
+          # Setup .netrc to prevent SPM from prompting for Keychain access on headless CI
+          echo -e "machine github.com\n  login oauth2\n  password $GH_TOKEN\n\n" > ~/.netrc
+          chmod 600 ~/.netrc
+
+          # Disable built-in SCM engine to use system Git binary and suppress macro validation prompts
+          defaults write com.apple.dt.Xcode IDEPackageSupportUseBuiltinSCM -bool NO
           defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES
           defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidation -bool YES
           defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES
@@ -184,7 +193,7 @@ jobs:
         run: |
           brew bundle --file Brewfile || brew install carthage swiftgen swiftlint xcbeautify
 
-      - name: Cache Carthage
+      - name: Cache Carthage Frameworks
         uses: actions/cache@v4
         with:
           path: |
@@ -200,10 +209,30 @@ jobs:
       - name: Cache Swift Package Dependencies
         uses: actions/cache@v4
         with:
-          path: ~/Library/Caches/org.swift.swiftpm
-          key: ${{ runner.os }}-spm-cache-${{ hashFiles('**/Package.resolved', '**/Swiftfin.xcodeproj/**') }}
+          path: |
+            .build/SourcePackages
+            ~/Library/Caches/org.swift.swiftpm
+          key: ${{ runner.os }}-spm-packages-${{ hashFiles('**/Package.resolved', 'Swiftfin.xcodeproj/**') }}
           restore-keys: |
-            ${{ runner.os }}-spm-cache-
+            ${{ runner.os }}-spm-packages-
+
+      - name: Resolve Swift Package Dependencies (Unpiped)
+        env:
+          SCHEME: ${{ matrix.scheme }}
+        run: |
+          set -euo pipefail
+          echo "📦 Pre-resolving Swift Package dependencies..."
+          mkdir -p .build/SourcePackages
+
+          # Run standalone resolution without piping to xcbeautify to avoid stdin buffering deadlocks
+          xcodebuild -resolvePackageDependencies \
+            -project Swiftfin.xcodeproj \
+            -scheme "${SCHEME}" \
+            -clonedSourcePackagesDirPath ".build/SourcePackages" \
+            -scmProvider system \
+            -packageAuthorizationProvider netrc \
+            -skipMacroValidation \
+            -skipPackagePluginValidation
 
       - name: Build Unsigned Archive & Package IPA
         env:
@@ -221,7 +250,7 @@ jobs:
 
           mkdir -p build
 
-          echo "⚙️ Archiving ${SCHEME} without code signing (SPM resolution handled automatically)..."
+          echo "⚙️ Archiving ${SCHEME} using pre-resolved local packages..."
           xcodebuild archive \
             -project Swiftfin.xcodeproj \
             -scheme "${SCHEME}" \
@@ -229,17 +258,19 @@ jobs:
             -destination "${DESTINATION}" \
             -archivePath "${ARCHIVE_PATH}" \
             -clonedSourcePackagesDirPath ".build/SourcePackages" \
+            -onlyUsePackageVersionsFromResolvedFile \
             -skipMacroValidation \
             -skipPackagePluginValidation \
+            COMPILER_INDEX_STORE_ENABLE=NO \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGN_ENTITLEMENTS="" \
-            AD_HOC_CODE_SIGNING_ALLOWED=YES | xcbeautify || true
+            AD_HOC_CODE_SIGNING_ALLOWED=YES | xcbeautify
 
           echo "📦 Locating .app bundle..."
           APP_PATH=$(find "${ARCHIVE_PATH}/Products/Applications" -maxdepth 1 -name "*.app" | head -n 1)
-          
+
           if [ -z "$APP_PATH" ] || [ ! -d "$APP_PATH" ]; then
             echo "❌ Failed to find compiled .app bundle in ${ARCHIVE_PATH}/Products/Applications"
             exit 1
@@ -301,10 +332,10 @@ jobs:
           fi
 
           echo "🚀 Publishing 1:1 Release '$TAG' with title '$RELEASE_TITLE'..."
-          
+
           gh release delete "$TAG" --yes 2>/dev/null || true
           git tag -d "$TAG" 2>/dev/null || true
-          
+
           EXTRA_FLAGS=()
           if [ "$IS_PRERELEASE" = "true" ]; then
             EXTRA_FLAGS+=("--prerelease")
