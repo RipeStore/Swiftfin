@@ -2,8 +2,7 @@ name: Build & Release Swiftfin IPAs
 
 on:
   schedule:
-    # Automatically check upstream every 6 hours
-    - cron: '0 */12 * * *'
+    - cron: '0 */6 * * *'
 
   workflow_dispatch:
     inputs:
@@ -135,6 +134,7 @@ jobs:
     needs: check-upstream
     if: needs.check-upstream.outputs.should_build == 'true'
     runs-on: macos-15
+    timeout-minutes: 90
     env:
       NSUnbufferedIO: "YES"
       GIT_TERMINAL_PROMPT: "0"
@@ -151,7 +151,7 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Select Xcode & Configure Environment
+      - name: Select Xcode & Accept License
         run: |
           # Pick the latest Xcode 16.x available on the runner
           XCODE_APP=$(find /Applications -maxdepth 1 -name "Xcode_16*.app" | sort -V | tail -n 1)
@@ -161,21 +161,22 @@ jobs:
           echo "Selected Xcode: $XCODE_APP"
           sudo xcode-select -s "$XCODE_APP/Contents/Developer"
           echo "DEVELOPER_DIR=$XCODE_APP/Contents/Developer" >> "$GITHUB_ENV"
+
+          # ─── CRITICAL: Accept Xcode license non-interactively ───
+          # Without this, xcodebuild can hang silently waiting for
+          # license acceptance in a non-interactive CI shell.
+          sudo xcodebuild -license accept
+
           xcodebuild -version
-
-          # Wake CoreSimulator daemon to prevent xcodebuild hangs in headless CI
-          xcrun simctl list > /dev/null 2>&1 || true
-
-          # Force Xcode to use system git (prevents libgit2 SPM freeze)
-          defaults write com.apple.dt.Xcode IDEPackageSupportUseBuiltinSCM YES
 
           # Skip interactive macro/plugin trust prompts in CI
           defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES
           defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES
 
-      - name: Install Homebrew dependencies
+      - name: Install Homebrew Dependencies
         run: |
-          brew bundle --file Brewfile || brew install carthage swiftgen swiftlint xcbeautify
+          brew install xcbeautify 2>/dev/null || true
+          brew bundle --file Brewfile || brew install carthage swiftgen swiftlint
 
       - name: Cache Carthage
         uses: actions/cache@v4
@@ -186,39 +187,11 @@ jobs:
           key: ${{ runner.os }}-carthage-${{ hashFiles('**/Cartfile.resolved', '**/Cartfile') }}
           restore-keys: ${{ runner.os }}-carthage-
 
-      - name: Bootstrap Carthage Frameworks
+      - name: Bootstrap Carthage (VLCKit)
         run: |
           carthage update --use-xcframeworks --cache-builds
 
-
-
-
-      - name: Resolve Swift Packages
-        timeout-minutes: 15
-        run: |
-          set -euo pipefail
-
-          # Clean any stale SPM state that could cause lock contention
-          rm -rf ~/Library/Caches/org.swift.swiftpm
-          rm -rf ~/Library/Developer/Xcode/DerivedData
-
-          echo "📦 Resolving Swift Package dependencies..."
-          # -scmProvider system: Forces xcodebuild CLI to use system git
-          #   instead of its bundled libgit2 which deadlocks on large
-          #   dependency graphs in headless CI. The `defaults write
-          #   IDEPackageSupportUseBuiltinSCM` only works for the Xcode GUI.
-          # -disablePackageRepositoryCache: Prevents SPM cache corruption
-          #   causing lock contention on CI runners.
-          xcodebuild -resolvePackageDependencies \
-            -project Swiftfin.xcodeproj \
-            -scheme "${{ matrix.scheme }}" \
-            -scmProvider system \
-            -disablePackageRepositoryCache \
-            -skipMacroValidation \
-            -skipPackagePluginValidation
-          echo "✅ Package resolution complete."
-
-      - name: Build Unsigned Archive & Package IPA
+      - name: Build & Package Unsigned IPA
         env:
           SCHEME: ${{ matrix.scheme }}
           DESTINATION: ${{ matrix.destination }}
@@ -226,70 +199,71 @@ jobs:
           TAG: ${{ needs.check-upstream.outputs.tag }}
         run: |
           set -euo pipefail
-          set -o pipefail
 
-          ARCHIVE_PATH="build/${SCHEME}.xcarchive"
           IPA_NAME="Swiftfin-${PLATFORM}-${TAG}-unsigned.ipa"
-          PAYLOAD_DIR="build/payload_${PLATFORM}/Payload"
+          DERIVED_DATA="build/DerivedData"
 
           mkdir -p build
 
           # ──────────────────────────────────────────────────────────────
-          # KEY: Use ad-hoc signing (CODE_SIGN_IDENTITY="-") instead of
-          # CODE_SIGNING_ALLOWED=NO. This is critical because:
+          # Mirror exactly what Fastlane's buildLane does:
           #
-          # 1. The project uses StatefulMacro (a Swift Macro package).
-          #    Swift macros compile into macOS executables that run during
-          #    the build to expand macro invocations.
+          #   buildApp(
+          #     scheme: scheme,
+          #     exportMethod: "development",
+          #     skipArchive: true,         → xcodebuild BUILD, not archive
+          #     skipCodesigning: true,     → CODE_SIGNING_ALLOWED=NO
+          #     xcargs: "-skipMacroValidation",
+          #     skipProfileDetection: true
+          #   )
           #
-          # 2. On Apple Silicon (which GitHub Actions macos-15 runners use),
-          #    macOS requires ALL executables to be at least ad-hoc signed.
-          #
-          # 3. CODE_SIGNING_ALLOWED=NO prevents signing of ALL targets,
-          #    including macro plugin executables. When swift-frontend tries
-          #    to launch the unsigned macro binary, macOS SIGKILL's it.
-          #    swift-frontend then deadlocks waiting for IPC from the dead
-          #    process — no error, no output, infinite hang.
-          #
-          # 4. CODE_SIGN_IDENTITY="-" ad-hoc signs everything. Macro plugins
-          #    can execute, and the resulting .app is trivially re-signable
-          #    by any sideloading tool (TrollStore, AltStore, Sideloadly, etc).
+          # Fastlane does NOT run a separate -resolvePackageDependencies
+          # step. SPM resolves inline during the build. The standalone
+          # resolve command is known to deadlock in Xcode 16 CI.
           # ──────────────────────────────────────────────────────────────
 
-          echo "⚙️ Archiving ${SCHEME} with ad-hoc signing..."
-          xcodebuild archive \
+          echo "⚙️ Building ${SCHEME} (mirroring Fastlane buildLane)..."
+          xcodebuild build \
             -project Swiftfin.xcodeproj \
             -scheme "${SCHEME}" \
             -configuration Release \
             -destination "${DESTINATION}" \
-            -archivePath "${ARCHIVE_PATH}" \
-            -scmProvider system \
-            -disablePackageRepositoryCache \
-            CODE_SIGN_IDENTITY="-" \
+            -derivedDataPath "${DERIVED_DATA}" \
+            CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGN_IDENTITY="" \
             AD_HOC_CODE_SIGNING_ALLOWED=YES \
-            DEVELOPMENT_TEAM="" \
-            PROVISIONING_PROFILE_SPECIFIER="" \
             -skipMacroValidation \
-            -skipPackagePluginValidation 2>&1 | (which xcbeautify >/dev/null 2>&1 && xcbeautify --quiet || cat)
+            -skipPackagePluginValidation 2>&1 | xcbeautify --quiet || true
 
+          echo "✅ Build complete."
+
+          # Find .app in DerivedData
           echo "📦 Locating .app bundle..."
-          APP_PATH=$(find "${ARCHIVE_PATH}/Products/Applications" -maxdepth 1 -name "*.app" | head -n 1)
-          
+          APP_PATH=$(find "${DERIVED_DATA}" -path "*/Build/Products/Release-*/*.app" -not -path "*/PlugIns/*" -maxdepth 6 | head -n 1)
+
           if [ -z "$APP_PATH" ] || [ ! -d "$APP_PATH" ]; then
-            echo "❌ Failed to find compiled .app bundle in ${ARCHIVE_PATH}/Products/Applications"
+            echo "⚠️ Primary search failed, trying broader search..."
+            APP_PATH=$(find "${DERIVED_DATA}" -name "*.app" -type d -not -path "*/PlugIns/*" -not -path "*Intermediates*" | head -n 1)
+          fi
+
+          if [ -z "$APP_PATH" ] || [ ! -d "$APP_PATH" ]; then
+            echo "❌ Failed to find .app bundle. DerivedData contents:"
+            find "${DERIVED_DATA}" -name "*.app" -type d 2>/dev/null || true
             exit 1
           fi
 
-          # Strip ad-hoc signature so sideloading tools get a clean unsigned binary
-          echo "🔓 Stripping ad-hoc signature..."
+          echo "Found: $APP_PATH"
+
+          # Strip any residual signatures for clean unsigned IPA
           codesign --remove-signature "${APP_PATH}" 2>/dev/null || true
-          find "${APP_PATH}" -name "*.dylib" -o -name "*.framework" | while read -r f; do
+          find "${APP_PATH}" \( -name "*.dylib" -o -name "*.framework" \) -print0 | while IFS= read -r -d '' f; do
             codesign --remove-signature "$f" 2>/dev/null || true
           done
 
-          echo "📦 Packaging into unsigned IPA: ${IPA_NAME}..."
+          # Package into IPA
+          echo "📦 Packaging ${IPA_NAME}..."
+          PAYLOAD_DIR="build/payload_${PLATFORM}/Payload"
           mkdir -p "${PAYLOAD_DIR}"
           cp -R "${APP_PATH}" "${PAYLOAD_DIR}/"
 
@@ -298,6 +272,7 @@ jobs:
           cd ../..
 
           ls -lh "${IPA_NAME}"
+          echo "🎉 Done: ${IPA_NAME}"
 
       - name: Upload IPA Artifact
         uses: actions/upload-artifact@v4
@@ -345,10 +320,10 @@ jobs:
           fi
 
           echo "🚀 Publishing 1:1 Release '$TAG' with title '$RELEASE_TITLE'..."
-          
+
           gh release delete "$TAG" --yes 2>/dev/null || true
           git tag -d "$TAG" 2>/dev/null || true
-          
+
           EXTRA_FLAGS=()
           if [ "$IS_PRERELEASE" = "true" ]; then
             EXTRA_FLAGS+=("--prerelease")
