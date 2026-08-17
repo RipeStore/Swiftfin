@@ -9,13 +9,10 @@ With a Jellyfin server, you can:
 
 This is an official Jellyfin companion app. Thank you for using Jellyfin!
 
-<p align="center">
-  <img src="screenshots/screenshot-1.webp" width="22%" alt="Swiftfin Home" />
-  <img src="screenshots/screenshot-2.webp" width="22%" alt="Swiftfin Item View" />
-  <img src="screenshots/screenshot-3.webp" width="22%" alt="Swiftfin Seasons" />
-  <img src="screenshots/screenshot-4.webp" width="22%" alt="Swiftfin Library" />
-</p>
+| | |
+|---|---|
+| <img src="screenshots/screenshot-1.webp" width="100%"/> | <img src="screenshots/screenshot-2.webp" width="100%"/> |
+| <img src="screenshots/screenshot-3.webp" width="100%"/> | <img src="screenshots/screenshot-4.webp" width="100%"/> |
+| <img src="screenshots/screenshot-5.webp" width="100%"/> | |
 
-<p align="center">
-  <img src="screenshots/screenshot-5.webp" width="90%" alt="Swiftfin Player" />
-</p>
+<!-- Upstream Swiftfin Source Code Repository: https://github.com/jellyfin/Swiftfin -->
