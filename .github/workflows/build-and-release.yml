@@ -3,7 +3,7 @@ name: Build & Release Swiftfin IPAs
 on:
   schedule:
     # Automatically check upstream every 6 hours
-    - cron: '0 */6 * * *'
+    - cron: '0 */12 * * *'
 
   workflow_dispatch:
     inputs:
@@ -171,7 +171,7 @@ jobs:
           xcrun simctl list > /dev/null 2>&1 || true
 
           # Force Xcode to use native System Git rather than libgit2 (prevents SPM package freeze)
-          defaults write com.apple.dt.Xcode IDEPackageSupportUseBuiltinSCM YES
+          defaults write com.apple.dt.Xcode IDEPackageSupportUseBuiltinSCM NO
           defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES
           defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES
 
@@ -224,7 +224,8 @@ jobs:
               -project Swiftfin.xcodeproj \
               -scheme "${{ matrix.scheme }}" \
               -skipMacroValidation \
-              -skipPackagePluginValidation 2>&1 | (which xcbeautify >/dev/null && xcbeautify || cat); then
+              -skipPackagePluginValidation \
+              -disablePackageRepositoryCache 2>&1 | (which xcbeautify >/dev/null && xcbeautify || cat); then
               echo "✅ Package resolution succeeded!"
               break
             fi
