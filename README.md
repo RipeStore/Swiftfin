@@ -1,6 +1,6 @@
-Built through third-party automation.
-
 Swiftfin is a fast, native video player that works with Jellyfin, the open source free software media server.
+
+This build is distributed by a third-party not related to Jellyfin/Swiftfin.
 
 To use the app, you must have a Jellyfin server set up and running. Find out more at https://jellyfin.org
 
