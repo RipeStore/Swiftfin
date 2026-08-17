@@ -43,8 +43,6 @@ jobs:
       should_build: ${{ steps.resolve.outputs.should_build }}
       tag: ${{ steps.resolve.outputs.tag }}
       git_ref: ${{ steps.resolve.outputs.git_ref }}
-      release_title: ${{ steps.resolve.outputs.release_title }}
-      release_body: ${{ steps.resolve.outputs.release_body }}
       prerelease: ${{ steps.resolve.outputs.prerelease }}
       matrix: ${{ steps.resolve.outputs.matrix }}
     steps:
@@ -114,18 +112,6 @@ jobs:
 
           echo "🚀 Target confirmed: Building $TARGET_REF as release $TAG_NAME"
 
-          # Fetch upstream release metadata if available
-          RELEASE_TITLE="Swiftfin $TAG_NAME"
-          RELEASE_BODY="Automated unsigned IPA build tracking upstream [$TARGET_REF](https://github.com/$UPSTREAM_REPO)."
-
-          UPSTREAM_RELEASE_DATA=$(gh api "repos/$UPSTREAM_REPO/releases/tags/$TARGET_REF" 2>/dev/null || true)
-          if [ -n "$UPSTREAM_RELEASE_DATA" ]; then
-            UPSTREAM_NAME=$(echo "$UPSTREAM_RELEASE_DATA" | jq -r '.name // empty')
-            UPSTREAM_BODY=$(echo "$UPSTREAM_RELEASE_DATA" | jq -r '.body // empty')
-            [ -n "$UPSTREAM_NAME" ] && RELEASE_TITLE="$UPSTREAM_NAME"
-            [ -n "$UPSTREAM_BODY" ] && RELEASE_BODY="$UPSTREAM_BODY"
-          fi
-
           # Resolve build matrix
           case "$INPUT_PLATFORM" in
             ios)
@@ -146,16 +132,8 @@ jobs:
           echo "should_build=true" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG_NAME" >> "$GITHUB_OUTPUT"
           echo "git_ref=$TARGET_REF" >> "$GITHUB_OUTPUT"
-          echo "release_title=$RELEASE_TITLE" >> "$GITHUB_OUTPUT"
           echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
-
-          # Escape multi-line body for GITHUB_OUTPUT
-          {
-            echo "release_body<<EOF"
-            echo "$RELEASE_BODY"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
 
   build-ipa:
     name: Build Unsigned IPA (${{ matrix.platform }})
@@ -268,52 +246,33 @@ jobs:
           pattern: ipa-*
           merge-multiple: true
 
-      - name: Generate Checksums & Create Release
+      - name: Clone Exact Upstream Release Notes & Publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.check-upstream.outputs.tag }}
-          TITLE: ${{ needs.check-upstream.outputs.release_title }}
-          BODY: ${{ needs.check-upstream.outputs.release_body }}
+          GIT_REF: ${{ needs.check-upstream.outputs.git_ref }}
           IS_PRERELEASE: ${{ needs.check-upstream.outputs.prerelease }}
         run: |
           set -euo pipefail
 
-          echo "🔐 Computing SHA256 checksums..."
-          sha256sum *.ipa > sha256sums.txt
-          cat sha256sums.txt
+          UPSTREAM_REPO="jellyfin/Swiftfin"
 
-          echo "📝 Building release notes..."
-          cat << 'EOF' > release_notes.md
-          ### 📱 Swiftfin Unsigned IPAs
+          echo "📥 Fetching 1:1 release notes from upstream $UPSTREAM_REPO for $GIT_REF..."
+          UPSTREAM_RELEASE_DATA=$(gh api "repos/$UPSTREAM_REPO/releases/tags/$GIT_REF" 2>/dev/null || true)
+          if [ -z "$UPSTREAM_RELEASE_DATA" ] && [ "$GIT_REF" != "$TAG" ]; then
+            UPSTREAM_RELEASE_DATA=$(gh api "repos/$UPSTREAM_REPO/releases/tags/$TAG" 2>/dev/null || true)
+          fi
 
-          Unsigned `.ipa` binaries built directly from [jellyfin/Swiftfin](https://github.com/jellyfin/Swiftfin).
+          RELEASE_TITLE="$TAG"
+          if [ -n "$UPSTREAM_RELEASE_DATA" ]; then
+            FETCHED_TITLE=$(echo "$UPSTREAM_RELEASE_DATA" | jq -r '.name // empty')
+            [ -n "$FETCHED_TITLE" ] && RELEASE_TITLE="$FETCHED_TITLE"
+            echo "$UPSTREAM_RELEASE_DATA" | jq -r '.body // ""' > release_notes.md
+          else
+            touch release_notes.md
+          fi
 
-          #### 📥 Sideloading
-          Sign or install with any sideloading tool:
-          - **iOS**: TrollStore, SideStore, AltStore, Sideloadly, Feather, LiveContainer
-          - **tvOS**: Sideloadly, Apple Configurator, TrollStore (tvOS 15-17.0)
-
-          #### 🔒 SHA256 Checksums
-          ```
-          EOF
-
-          # Strip leading indentation from the template
-          sed -i 's/^          //' release_notes.md
-          
-          # Append sha256 checksums
-          cat sha256sums.txt >> release_notes.md
-          
-          cat << 'EOF' >> release_notes.md
-          ```
-
-          ---
-          ### Upstream Release Notes
-          EOF
-          sed -i 's/^          //' release_notes.md
-
-          echo "$BODY" >> release_notes.md
-
-          echo "🚀 Creating GitHub Release $TAG..."
+          echo "🚀 Publishing 1:1 Release '$TAG' with title '$RELEASE_TITLE'..."
           
           # Delete existing release if force rebuild was requested
           gh release delete "$TAG" --yes 2>/dev/null || true
@@ -325,8 +284,7 @@ jobs:
           fi
 
           gh release create "$TAG" \
-            --title "$TITLE" \
+            --title "$RELEASE_TITLE" \
             --notes-file release_notes.md \
             "${EXTRA_FLAGS[@]}" \
-            *.ipa \
-            sha256sums.txt
+            *.ipa
