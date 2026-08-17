@@ -282,27 +282,36 @@ jobs:
           sha256sum *.ipa > sha256sums.txt
           cat sha256sums.txt
 
-          NOTES=$(cat << 'EOF'
-### 📱 Swiftfin Unsigned IPAs
+          echo "📝 Building release notes..."
+          cat << 'EOF' > release_notes.md
+          ### 📱 Swiftfin Unsigned IPAs
 
-Unsigned `.ipa` binaries built directly from [jellyfin/Swiftfin](https://github.com/jellyfin/Swiftfin).
+          Unsigned `.ipa` binaries built directly from [jellyfin/Swiftfin](https://github.com/jellyfin/Swiftfin).
 
-#### 📥 Sideloading
-Sign or install with any sideloading tool:
-- **iOS**: TrollStore, SideStore, AltStore, Sideloadly, Feather, LiveContainer
-- **tvOS**: Sideloadly, Apple Configurator, TrollStore (tvOS 15-17.0)
+          #### 📥 Sideloading
+          Sign or install with any sideloading tool:
+          - **iOS**: TrollStore, SideStore, AltStore, Sideloadly, Feather, LiveContainer
+          - **tvOS**: Sideloadly, Apple Configurator, TrollStore (tvOS 15-17.0)
 
-#### 🔒 SHA256 Checksums
-```
-$(cat sha256sums.txt)
-```
+          #### 🔒 SHA256 Checksums
+          ```
+          EOF
 
----
-### Upstream Release Notes
-${BODY}
-EOF
-)
-          FORMATTED_NOTES=$(echo "$NOTES" | sed "s|\${BODY}|$BODY|g")
+          # Strip leading indentation from the template
+          sed -i 's/^          //' release_notes.md
+          
+          # Append sha256 checksums
+          cat sha256sums.txt >> release_notes.md
+          
+          cat << 'EOF' >> release_notes.md
+          ```
+
+          ---
+          ### Upstream Release Notes
+          EOF
+          sed -i 's/^          //' release_notes.md
+
+          echo "$BODY" >> release_notes.md
 
           echo "🚀 Creating GitHub Release $TAG..."
           
@@ -317,7 +326,7 @@ EOF
 
           gh release create "$TAG" \
             --title "$TITLE" \
-            --notes "$FORMATTED_NOTES" \
+            --notes-file release_notes.md \
             "${EXTRA_FLAGS[@]}" \
             *.ipa \
             sha256sums.txt
