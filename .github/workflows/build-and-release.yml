@@ -133,12 +133,12 @@ jobs:
     name: Build Unsigned IPA (${{ matrix.platform }})
     needs: check-upstream
     if: needs.check-upstream.outputs.should_build == 'true'
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 120
     env:
       NSUnbufferedIO: "YES"
       GIT_TERMINAL_PROMPT: "0"
-      XCODE_VERSION: "16.4"
+      XCODE_VERSION: "26.6"
     strategy:
       fail-fast: false
       matrix:
@@ -160,8 +160,9 @@ jobs:
 
       - name: Select Xcode & Accept License
         run: |
-          XCODE_APP=$(find /Applications -maxdepth 1 -name "Xcode_16*.app" | sort -V | tail -n 1)
-          if [ -z "$XCODE_APP" ]; then
+          # Try exact match first, then fallback to latest available
+          XCODE_APP="/Applications/Xcode_${XCODE_VERSION}.app"
+          if [ ! -d "$XCODE_APP" ]; then
             XCODE_APP=$(find /Applications -maxdepth 1 -name "Xcode*.app" | sort -V | tail -n 1)
           fi
           echo "Selected Xcode: $XCODE_APP"
