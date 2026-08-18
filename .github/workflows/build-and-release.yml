@@ -2,7 +2,7 @@ name: Build & Release Swiftfin IPAs
 
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 */12 * * *'
 
   workflow_dispatch:
     inputs:
@@ -181,7 +181,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: Carthage
-          key: ${{ runner.os }}-carthage-${{ hashFiles('**/Cartfile.resolved') }}
+          key: ${{ runner.os }}-carthage-${{ hashFiles('**/Cartfile') }}
           restore-keys: ${{ runner.os }}-carthage-
 
       - name: Update Carthage (VLCKit)
