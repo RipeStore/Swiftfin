@@ -2,7 +2,7 @@ name: Build & Release Swiftfin IPAs
 
 on:
   schedule:
-    - cron: '0 */12 * * *'
+    - cron: '0 */6 * * *'
 
   workflow_dispatch:
     inputs:
@@ -138,6 +138,7 @@ jobs:
     env:
       NSUnbufferedIO: "YES"
       GIT_TERMINAL_PROMPT: "0"
+      XCODE_VERSION: "16.4"
     strategy:
       fail-fast: false
       matrix:
@@ -186,14 +187,26 @@ jobs:
       - name: Update Carthage (VLCKit)
         run: carthage update --use-xcframeworks --cache-builds
 
-      # ─── Build via Fastlane (exact same command as official CI) ───
+      # ─── Pre-resolve SPM to isolate network fetches with a dedicated timeout ───
+      - name: Resolve SPM Dependencies
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          echo "🔄 Pre-resolving Swift Package Manager dependencies..."
+          xcodebuild -resolvePackageDependencies \
+            -scheme "${{ matrix.scheme }}" \
+            -project ./Swiftfin.xcodeproj \
+            -disableAutomaticPackageResolution
+          echo "✅ SPM dependencies resolved"
+
+      # ─── Build via Fastlane (mirrors official Swiftfin CI) ───
       - name: Build via Fastlane
         uses: nick-fields/retry@v2
         with:
           max_attempts: 3
           retry_on: error
           timeout_minutes: 60
-          command: bundle exec fastlane buildLane scheme:"\"${{ matrix.scheme }}\""
+          command: bundle exec fastlane buildLane scheme:"\"${{ matrix.scheme }}\"" xcodeVersion:${{ env.XCODE_VERSION }}
 
       # ─── Package .app from DerivedData into unsigned IPA ───
       - name: Package Unsigned IPA
